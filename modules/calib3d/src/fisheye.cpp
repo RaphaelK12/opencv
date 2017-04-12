@@ -377,6 +377,12 @@ void cv::fisheye::undistortPoints( InputArray distorted, OutputArray undistorted
         double scale = 1.0;
 
         double theta_d = sqrt(pw[0]*pw[0] + pw[1]*pw[1]);
+
+        // the current camera model is only valid up to 180° FOV
+        // for larger FOV the loop below does not converge
+        // clip values so we still get plausible results for super fisheye images > 180°
+        theta_d = min(max(-CV_PI/2., theta_d), CV_PI/2.);
+
         if (theta_d > 1e-8)
         {
             // compensate distortion iteratively
@@ -531,26 +537,16 @@ void cv::fisheye::estimateNewCameraMatrixForUndistortRectify(InputArray K, Input
     int w = image_size.width, h = image_size.height;
     balance = std::min(std::max(balance, 0.0), 1.0);
 
-    cv::Mat points(1, 4, CV_64FC2);
+    cv::Mat points(1, 8, CV_64FC2);
     Vec2d* pptr = points.ptr<Vec2d>();
-    pptr[0] = Vec2d(w/2, 0);
-    pptr[1] = Vec2d(w, h/2);
-    pptr[2] = Vec2d(w/2, h);
-    pptr[3] = Vec2d(0, h/2);
-
-#if 0
-    const int N = 10;
-    cv::Mat points(1, N * 4, CV_64FC2);
-    Vec2d* pptr = points.ptr<Vec2d>();
-    for(int i = 0, k = 0; i < 10; ++i)
-    {
-        pptr[k++] = Vec2d(w/2,   0) - Vec2d(w/8,   0) + Vec2d(w/4/N*i,   0);
-        pptr[k++] = Vec2d(w/2, h-1) - Vec2d(w/8, h-1) + Vec2d(w/4/N*i, h-1);
-
-        pptr[k++] = Vec2d(0,   h/2) - Vec2d(0,   h/8) + Vec2d(0,   h/4/N*i);
-        pptr[k++] = Vec2d(w-1, h/2) - Vec2d(w-1, h/8) + Vec2d(w-1, h/4/N*i);
-    }
-#endif
+    pptr[0] = Vec2d(0, 0);
+    pptr[1] = Vec2d(w/2, 0);
+    pptr[2] = Vec2d(w, 0);
+    pptr[3] = Vec2d(w, h/2);
+    pptr[4] = Vec2d(w, h);
+    pptr[5] = Vec2d(w/2, h);
+    pptr[6] = Vec2d(0, h);
+    pptr[7] = Vec2d(0, h/2);
 
     fisheye::undistortPoints(points, points, K, D, R);
     cv::Scalar center_mass = mean(points);
@@ -567,30 +563,23 @@ void cv::fisheye::estimateNewCameraMatrixForUndistortRectify(InputArray K, Input
     double minx = DBL_MAX, miny = DBL_MAX, maxx = -DBL_MAX, maxy = -DBL_MAX;
     for(size_t i = 0; i < points.total(); ++i)
     {
-        miny = std::min(miny, pptr[i][1]);
-        maxy = std::max(maxy, pptr[i][1]);
-        minx = std::min(minx, pptr[i][0]);
-        maxx = std::max(maxx, pptr[i][0]);
+        if(i!=1 && i!=5){
+            minx = std::min(minx, std::abs(pptr[i][0]-cn[0]));
+        }
+        if(i!=3 && i!=7){
+            miny = std::min(miny, std::abs(pptr[i][1]-cn[1]));
+        }
+        maxy = std::max(maxy, std::abs(pptr[i][1]-cn[1]));
+        maxx = std::max(maxx, std::abs(pptr[i][0]-cn[0]));
     }
 
-#if 0
-    double minx = -DBL_MAX, miny = -DBL_MAX, maxx = DBL_MAX, maxy = DBL_MAX;
-    for(size_t i = 0; i < points.total(); ++i)
-    {
-        if (i % 4 == 0) miny = std::max(miny, pptr[i][1]);
-        if (i % 4 == 1) maxy = std::min(maxy, pptr[i][1]);
-        if (i % 4 == 2) minx = std::max(minx, pptr[i][0]);
-        if (i % 4 == 3) maxx = std::min(maxx, pptr[i][0]);
-    }
-#endif
+    double f1 = w * 0.5/(minx);
+    double f2 = w * 0.5/(maxx);
+    double f3 = h * 0.5 * aspect_ratio/(miny);
+    double f4 = h * 0.5 * aspect_ratio/(maxy);
 
-    double f1 = w * 0.5/(cn[0] - minx);
-    double f2 = w * 0.5/(maxx - cn[0]);
-    double f3 = h * 0.5 * aspect_ratio/(cn[1] - miny);
-    double f4 = h * 0.5 * aspect_ratio/(maxy - cn[1]);
-
-    double fmin = std::min(f1, std::min(f2, std::min(f3, f4)));
-    double fmax = std::max(f1, std::max(f2, std::max(f3, f4)));
+    double fmax = std::max(f1, f3);
+    double fmin = std::min(f2, f4);
 
     double f = balance * fmin + (1.0 - balance) * fmax;
     f *= fov_scale > 0 ? 1.0/fov_scale : 1.0;
@@ -1033,8 +1022,10 @@ double cv::fisheye::stereoCalibrate(InputArrayOfArrays objectPoints, InputArrayO
         int b = cv::countNonZero(intrinsicRight.isEstimate);
         cv::Mat deltas;
         solve(J.t() * J, J.t()*e, deltas);
-        intrinsicLeft = intrinsicLeft + deltas.rowRange(0, a);
-        intrinsicRight = intrinsicRight + deltas.rowRange(a, a + b);
+        if (a > 0)
+            intrinsicLeft = intrinsicLeft + deltas.rowRange(0, a);
+        if (b > 0)
+            intrinsicRight = intrinsicRight + deltas.rowRange(a, a + b);
         omcur = omcur + cv::Vec3d(deltas.rowRange(a + b, a + b + 3));
         Tcur = Tcur + cv::Vec3d(deltas.rowRange(a + b + 3, a + b + 6));
         for (int image_idx = 0; image_idx < n_images; ++image_idx)

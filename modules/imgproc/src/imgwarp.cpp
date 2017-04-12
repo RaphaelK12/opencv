@@ -51,6 +51,8 @@
 #include "opencl_kernels_imgproc.hpp"
 #include "hal_replacement.hpp"
 
+#include "opencv2/core/openvx/ovx_defs.hpp"
+
 using namespace cv;
 
 namespace cv
@@ -1647,7 +1649,7 @@ struct VResizeLanczos4
     {
         CastOp castOp;
         VecOp vecOp;
-        int k, x = vecOp((const uchar**)src, (uchar*)dst, (const uchar*)beta, width);
+        int x = vecOp((const uchar**)src, (uchar*)dst, (const uchar*)beta, width);
         #if CV_ENABLE_UNROLLED
         for( ; x <= width - 4; x += 4 )
         {
@@ -1655,7 +1657,7 @@ struct VResizeLanczos4
             const WT* S = src[0];
             WT s0 = S[x]*b, s1 = S[x+1]*b, s2 = S[x+2]*b, s3 = S[x+3]*b;
 
-            for( k = 1; k < 8; k++ )
+            for( int k = 1; k < 8; k++ )
             {
                 b = beta[k]; S = src[k];
                 s0 += S[x]*b; s1 += S[x+1]*b;
@@ -1702,10 +1704,6 @@ public:
         CV_Assert(ksize <= MAX_ESIZE);
     }
 
-#if defined(__GNUC__) && (__GNUC__ == 4) && (__GNUC_MINOR__ == 8)
-# pragma GCC diagnostic push
-# pragma GCC diagnostic ignored "-Warray-bounds"
-#endif
     virtual void operator() (const Range& range) const
     {
         int dy, cn = src.channels();
@@ -1735,7 +1733,7 @@ public:
                 int sy = clip(sy0 - ksize2 + 1 + k, 0, ssize.height);
                 for( k1 = std::max(k1, k); k1 < ksize; k1++ )
                 {
-                    if( sy == prev_sy[k1] ) // if the sy-th row has been computed already, reuse it.
+                    if( k1 < MAX_ESIZE && sy == prev_sy[k1] ) // if the sy-th row has been computed already, reuse it.
                     {
                         if( k1 > k )
                             memcpy( rows[k], rows[k1], bufstep*sizeof(rows[0][0]) );
@@ -1754,9 +1752,6 @@ public:
             vresize( (const WT**)rows, (T*)(dst.data + dst.step*dy), beta, dsize.width );
         }
     }
-#if defined(__GNUC__) && (__GNUC__ == 4) && (__GNUC_MINOR__ == 8)
-# pragma GCC diagnostic pop
-#endif
 
 private:
     Mat src;
@@ -2795,8 +2790,6 @@ public:
 
     virtual void operator() (const Range& range) const
     {
-        CV_INSTRUMENT_REGION_IPP()
-
         if (*ok == false)
             return;
 
@@ -3533,14 +3526,13 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
                           int borderType, const Scalar& _borderValue )
 {
     Size ssize = _src.size(), dsize = _dst.size();
-    int cn = _src.channels();
+    const int cn = _src.channels();
     const T* S0 = _src.ptr<T>();
+    T cval[CV_CN_MAX];
     size_t sstep = _src.step/sizeof(S0[0]);
-    Scalar_<T> cval(saturate_cast<T>(_borderValue[0]),
-        saturate_cast<T>(_borderValue[1]),
-        saturate_cast<T>(_borderValue[2]),
-        saturate_cast<T>(_borderValue[3]));
-    int dx, dy;
+
+    for(int k = 0; k < cn; k++ )
+        cval[k] = saturate_cast<T>(_borderValue[k & 3]);
 
     unsigned width1 = ssize.width, height1 = ssize.height;
 
@@ -3550,14 +3542,14 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
         dsize.height = 1;
     }
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
         T* D = _dst.ptr<T>(dy);
         const short* XY = _xy.ptr<short>(dy);
 
         if( cn == 1 )
         {
-            for( dx = 0; dx < dsize.width; dx++ )
+            for(int dx = 0; dx < dsize.width; dx++ )
             {
                 int sx = XY[dx*2], sy = XY[dx*2+1];
                 if( (unsigned)sx < width1 && (unsigned)sy < height1 )
@@ -3583,9 +3575,9 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
         }
         else
         {
-            for( dx = 0; dx < dsize.width; dx++, D += cn )
+            for(int dx = 0; dx < dsize.width; dx++, D += cn )
             {
-                int sx = XY[dx*2], sy = XY[dx*2+1], k;
+                int sx = XY[dx*2], sy = XY[dx*2+1];
                 const T *S;
                 if( (unsigned)sx < width1 && (unsigned)sy < height1 )
                 {
@@ -3602,7 +3594,7 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
                     else
                     {
                         S = S0 + sy*sstep + sx*cn;
-                        for( k = 0; k < cn; k++ )
+                        for(int k = 0; k < cn; k++ )
                             D[k] = S[k];
                     }
                 }
@@ -3622,7 +3614,7 @@ static void remapNearest( const Mat& _src, Mat& _dst, const Mat& _xy,
                         sy = borderInterpolate(sy, ssize.height, borderType);
                         S = S0 + sy*sstep + sx*cn;
                     }
-                    for( k = 0; k < cn; k++ )
+                    for(int k = 0; k < cn; k++ )
                         D[k] = S[k];
                 }
             }
@@ -3852,16 +3844,15 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
     typedef typename CastOp::rtype T;
     typedef typename CastOp::type1 WT;
     Size ssize = _src.size(), dsize = _dst.size();
-    int k, cn = _src.channels();
+    const int cn = _src.channels();
     const AT* wtab = (const AT*)_wtab;
     const T* S0 = _src.ptr<T>();
     size_t sstep = _src.step/sizeof(S0[0]);
     T cval[CV_CN_MAX];
-    int dx, dy;
     CastOp castOp;
     VecOp vecOp;
 
-    for( k = 0; k < cn; k++ )
+    for(int k = 0; k < cn; k++ )
         cval[k] = saturate_cast<T>(_borderValue[k & 3]);
 
     unsigned width1 = std::max(ssize.width-1, 0), height1 = std::max(ssize.height-1, 0);
@@ -3871,7 +3862,7 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
         width1 = std::max(ssize.width-2, 0);
 #endif
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
         T* D = _dst.ptr<T>(dy);
         const short* XY = _xy.ptr<short>(dy);
@@ -3879,7 +3870,7 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
         int X0 = 0;
         bool prevInlier = false;
 
-        for( dx = 0; dx <= dsize.width; dx++ )
+        for(int dx = 0; dx <= dsize.width; dx++ )
         {
             bool curInlier = dx < dsize.width ?
                 (unsigned)XY[dx*2] < width1 &&
@@ -3948,7 +3939,7 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                         int sx = XY[dx*2], sy = XY[dx*2+1];
                         const AT* w = wtab + FXY[dx]*4;
                         const T* S = S0 + sy*sstep + sx*cn;
-                        for( k = 0; k < cn; k++ )
+                        for(int k = 0; k < cn; k++ )
                         {
                             WT t0 = S[k]*w[0] + S[k+cn]*w[1] + S[sstep+k]*w[2] + S[sstep+k+cn]*w[3];
                             D[k] = castOp(t0);
@@ -4012,7 +4003,7 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                             (sx >= ssize.width || sx+1 < 0 ||
                              sy >= ssize.height || sy+1 < 0) )
                         {
-                            for( k = 0; k < cn; k++ )
+                            for(int k = 0; k < cn; k++ )
                                 D[k] = cval[k];
                         }
                         else
@@ -4046,7 +4037,7 @@ static void remapBilinear( const Mat& _src, Mat& _dst, const Mat& _xy,
                                 v2 = sx0 >= 0 && sy1 >= 0 ? S0 + sy1*sstep + sx0*cn : &cval[0];
                                 v3 = sx1 >= 0 && sy1 >= 0 ? S0 + sy1*sstep + sx1*cn : &cval[0];
                             }
-                            for( k = 0; k < cn; k++ )
+                            for(int k = 0; k < cn; k++ )
                                 D[k] = castOp(WT(v0[k]*w[0] + v1[k]*w[1] + v2[k]*w[2] + v3[k]*w[3]));
                         }
                     }
@@ -4064,16 +4055,16 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
     typedef typename CastOp::rtype T;
     typedef typename CastOp::type1 WT;
     Size ssize = _src.size(), dsize = _dst.size();
-    int cn = _src.channels();
+    const int cn = _src.channels();
     const AT* wtab = (const AT*)_wtab;
     const T* S0 = _src.ptr<T>();
     size_t sstep = _src.step/sizeof(S0[0]);
-    Scalar_<T> cval(saturate_cast<T>(_borderValue[0]),
-        saturate_cast<T>(_borderValue[1]),
-        saturate_cast<T>(_borderValue[2]),
-        saturate_cast<T>(_borderValue[3]));
-    int dx, dy;
+    T cval[CV_CN_MAX];
     CastOp castOp;
+
+    for(int k = 0; k < cn; k++ )
+        cval[k] = saturate_cast<T>(_borderValue[k & 3]);
+
     int borderType1 = borderType != BORDER_TRANSPARENT ? borderType : BORDER_REFLECT_101;
 
     unsigned width1 = std::max(ssize.width-3, 0), height1 = std::max(ssize.height-3, 0);
@@ -4084,21 +4075,20 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
         dsize.height = 1;
     }
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
         T* D = _dst.ptr<T>(dy);
         const short* XY = _xy.ptr<short>(dy);
         const ushort* FXY = _fxy.ptr<ushort>(dy);
 
-        for( dx = 0; dx < dsize.width; dx++, D += cn )
+        for(int dx = 0; dx < dsize.width; dx++, D += cn )
         {
             int sx = XY[dx*2]-1, sy = XY[dx*2+1]-1;
             const AT* w = wtab + FXY[dx]*16;
-            int i, k;
             if( (unsigned)sx < width1 && (unsigned)sy < height1 )
             {
                 const T* S = S0 + sy*sstep + sx*cn;
-                for( k = 0; k < cn; k++ )
+                for(int k = 0; k < cn; k++ )
                 {
                     WT sum = S[0]*w[0] + S[cn]*w[1] + S[cn*2]*w[2] + S[cn*3]*w[3];
                     S += sstep;
@@ -4123,21 +4113,21 @@ static void remapBicubic( const Mat& _src, Mat& _dst, const Mat& _xy,
                     (sx >= ssize.width || sx+4 <= 0 ||
                     sy >= ssize.height || sy+4 <= 0))
                 {
-                    for( k = 0; k < cn; k++ )
+                    for(int k = 0; k < cn; k++ )
                         D[k] = cval[k];
                     continue;
                 }
 
-                for( i = 0; i < 4; i++ )
+                for(int i = 0; i < 4; i++ )
                 {
                     x[i] = borderInterpolate(sx + i, ssize.width, borderType1)*cn;
                     y[i] = borderInterpolate(sy + i, ssize.height, borderType1);
                 }
 
-                for( k = 0; k < cn; k++, S0++, w -= 16 )
+                for(int k = 0; k < cn; k++, S0++, w -= 16 )
                 {
                     WT cv = cval[k], sum = cv*ONE;
-                    for( i = 0; i < 4; i++, w += 4 )
+                    for(int i = 0; i < 4; i++, w += 4 )
                     {
                         int yi = y[i];
                         const T* S = S0 + yi*sstep;
@@ -4169,16 +4159,16 @@ static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
     typedef typename CastOp::rtype T;
     typedef typename CastOp::type1 WT;
     Size ssize = _src.size(), dsize = _dst.size();
-    int cn = _src.channels();
+    const int cn = _src.channels();
     const AT* wtab = (const AT*)_wtab;
     const T* S0 = _src.ptr<T>();
     size_t sstep = _src.step/sizeof(S0[0]);
-    Scalar_<T> cval(saturate_cast<T>(_borderValue[0]),
-        saturate_cast<T>(_borderValue[1]),
-        saturate_cast<T>(_borderValue[2]),
-        saturate_cast<T>(_borderValue[3]));
-    int dx, dy;
+    T cval[CV_CN_MAX];
     CastOp castOp;
+
+    for(int k = 0; k < cn; k++ )
+        cval[k] = saturate_cast<T>(_borderValue[k & 3]);
+
     int borderType1 = borderType != BORDER_TRANSPARENT ? borderType : BORDER_REFLECT_101;
 
     unsigned width1 = std::max(ssize.width-7, 0), height1 = std::max(ssize.height-7, 0);
@@ -4189,21 +4179,20 @@ static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
         dsize.height = 1;
     }
 
-    for( dy = 0; dy < dsize.height; dy++ )
+    for(int dy = 0; dy < dsize.height; dy++ )
     {
         T* D = _dst.ptr<T>(dy);
         const short* XY = _xy.ptr<short>(dy);
         const ushort* FXY = _fxy.ptr<ushort>(dy);
 
-        for( dx = 0; dx < dsize.width; dx++, D += cn )
+        for(int dx = 0; dx < dsize.width; dx++, D += cn )
         {
             int sx = XY[dx*2]-3, sy = XY[dx*2+1]-3;
             const AT* w = wtab + FXY[dx]*64;
             const T* S = S0 + sy*sstep + sx*cn;
-            int i, k;
             if( (unsigned)sx < width1 && (unsigned)sy < height1 )
             {
-                for( k = 0; k < cn; k++ )
+                for(int k = 0; k < cn; k++ )
                 {
                     WT sum = 0;
                     for( int r = 0; r < 8; r++, S += sstep, w += 8 )
@@ -4226,21 +4215,21 @@ static void remapLanczos4( const Mat& _src, Mat& _dst, const Mat& _xy,
                     (sx >= ssize.width || sx+8 <= 0 ||
                     sy >= ssize.height || sy+8 <= 0))
                 {
-                    for( k = 0; k < cn; k++ )
+                    for(int k = 0; k < cn; k++ )
                         D[k] = cval[k];
                     continue;
                 }
 
-                for( i = 0; i < 8; i++ )
+                for(int i = 0; i < 8; i++ )
                 {
                     x[i] = borderInterpolate(sx + i, ssize.width, borderType1)*cn;
                     y[i] = borderInterpolate(sy + i, ssize.height, borderType1);
                 }
 
-                for( k = 0; k < cn; k++, S0++, w -= 64 )
+                for(int k = 0; k < cn; k++, S0++, w -= 64 )
                 {
                     WT cv = cval[k], sum = cv*ONE;
-                    for( i = 0; i < 8; i++, w += 8 )
+                    for(int i = 0; i < 8; i++, w += 8 )
                     {
                         int yi = y[i];
                         const T* S1 = S0 + yi*sstep;
@@ -4752,6 +4741,94 @@ static bool ocl_logPolar(InputArray _src, OutputArray _dst,
 }
 #endif
 
+#ifdef HAVE_OPENVX
+static bool openvx_remap(Mat src, Mat dst, Mat map1, Mat map2, int interpolation, const Scalar& borderValue)
+{
+    vx_interpolation_type_e inter_type;
+    switch (interpolation)
+    {
+    case INTER_LINEAR:
+#if VX_VERSION > VX_VERSION_1_0
+        inter_type = VX_INTERPOLATION_BILINEAR;
+#else
+        inter_type = VX_INTERPOLATION_TYPE_BILINEAR;
+#endif
+        break;
+    case INTER_NEAREST:
+/* NEAREST_NEIGHBOR mode disabled since OpenCV round half to even while OpenVX sample implementation round half up
+#if VX_VERSION > VX_VERSION_1_0
+        inter_type = VX_INTERPOLATION_NEAREST_NEIGHBOR;
+#else
+        inter_type = VX_INTERPOLATION_TYPE_NEAREST_NEIGHBOR;
+#endif
+        if (!map1.empty())
+            for (int y = 0; y < map1.rows; ++y)
+            {
+                float* line = map1.ptr<float>(y);
+                for (int x = 0; x < map1.cols; ++x)
+                    line[x] = cvRound(line[x]);
+            }
+        if (!map2.empty())
+            for (int y = 0; y < map2.rows; ++y)
+            {
+                float* line = map2.ptr<float>(y);
+                for (int x = 0; x < map2.cols; ++x)
+                    line[x] = cvRound(line[x]);
+            }
+        break;
+*/
+    case INTER_AREA://AREA interpolation mode is unsupported
+    default:
+        return false;
+    }
+
+    try
+    {
+        ivx::Context ctx = ovx::getOpenVXContext();
+
+        Mat a;
+        if (dst.data != src.data)
+            a = src;
+        else
+            src.copyTo(a);
+
+        ivx::Image
+            ia = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
+                ivx::Image::createAddressing(a.cols, a.rows, 1, (vx_int32)(a.step)), a.data),
+            ib = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
+                ivx::Image::createAddressing(dst.cols, dst.rows, 1, (vx_int32)(dst.step)), dst.data);
+
+        //ATTENTION: VX_CONTEXT_IMMEDIATE_BORDER attribute change could lead to strange issues in multi-threaded environments
+        //since OpenVX standart says nothing about thread-safety for now
+        ivx::border_t prevBorder = ctx.immediateBorder();
+        ctx.setImmediateBorder(VX_BORDER_CONSTANT, (vx_uint8)(borderValue[0]));
+
+        ivx::Remap map = ivx::Remap::create(ctx, src.cols, src.rows, dst.cols, dst.rows);
+        if (map1.empty()) map.setMappings(map2);
+        else if (map2.empty()) map.setMappings(map1);
+        else map.setMappings(map1, map2);
+        ivx::IVX_CHECK_STATUS(vxuRemap(ctx, ia, map, inter_type, ib));
+#ifdef VX_VERSION_1_1
+        ib.swapHandle();
+        ia.swapHandle();
+#endif
+
+        ctx.setImmediateBorder(prevBorder);
+    }
+    catch (ivx::RuntimeError & e)
+    {
+        CV_Error(CV_StsInternal, e.what());
+        return false;
+    }
+    catch (ivx::WrapperError & e)
+    {
+        CV_Error(CV_StsInternal, e.what());
+        return false;
+    }
+    return true;
+}
+#endif
+
 #if defined HAVE_IPP && IPP_DISABLE_BLOCK
 
 typedef IppStatus (CV_STDCALL * ippiRemap)(const void * pSrc, IppiSize srcSize, int srcStep, IppiRect srcRoi,
@@ -4772,8 +4849,6 @@ public:
 
     virtual void operator() (const Range & range) const
     {
-        CV_INSTRUMENT_REGION_IPP()
-
         IppiRect srcRoiRect = { 0, 0, src.cols, src.rows };
         Mat dstRoi = dst.rowRange(range);
         IppiSize dstRoiSize = ippiSize(dstRoi.size());
@@ -4856,6 +4931,19 @@ void cv::remap( InputArray _src, OutputArray _dst,
     Mat src = _src.getMat(), map1 = _map1.getMat(), map2 = _map2.getMat();
     _dst.create( map1.size(), src.type() );
     Mat dst = _dst.getMat();
+
+
+    CV_OVX_RUN(
+        src.type() == CV_8UC1 && dst.type() == CV_8UC1 &&
+        (borderType& ~BORDER_ISOLATED) == BORDER_CONSTANT &&
+        ((map1.type() == CV_32FC2 && map2.empty() && map1.size == dst.size) ||
+         (map1.type() == CV_32FC1 && map2.type() == CV_32FC1 && map1.size == dst.size && map2.size == dst.size) ||
+         (map1.empty() && map2.type() == CV_32FC2 && map2.size == dst.size)) &&
+        ((borderType & BORDER_ISOLATED) != 0 || !src.isSubmatrix()),
+        openvx_remap(src, dst, map1, map2, interpolation, borderValue));
+
+    CV_Assert( dst.cols < SHRT_MAX && dst.rows < SHRT_MAX && src.cols < SHRT_MAX && src.rows < SHRT_MAX );
+
     if( dst.data == src.data )
         src = src.clone();
 
@@ -5607,8 +5695,6 @@ public:
 
     virtual void operator() (const Range& range) const
     {
-        CV_INSTRUMENT_REGION_IPP()
-
         IppiSize srcsize = { src.cols, src.rows };
         IppiRect srcroi = { 0, 0, src.cols, src.rows };
         IppiRect dstroi = { 0, range.start, dst.cols, range.end - range.start };
@@ -5650,6 +5736,81 @@ private:
 #ifdef HAVE_OPENCL
 
 enum { OCL_OP_PERSPECTIVE = 1, OCL_OP_AFFINE = 0 };
+
+static bool ocl_warpTransform_cols4(InputArray _src, OutputArray _dst, InputArray _M0,
+                                    Size dsize, int flags, int borderType, const Scalar& borderValue,
+                                    int op_type)
+{
+    CV_Assert(op_type == OCL_OP_AFFINE || op_type == OCL_OP_PERSPECTIVE);
+    const ocl::Device & dev = ocl::Device::getDefault();
+    int type = _src.type(), dtype = _dst.type(), depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
+
+    int interpolation = flags & INTER_MAX;
+    if( interpolation == INTER_AREA )
+        interpolation = INTER_LINEAR;
+
+    if ( !dev.isIntel() || !(type == CV_8UC1) ||
+         !(dtype == CV_8UC1) || !(_dst.cols() % 4 == 0) ||
+         !(borderType == cv::BORDER_CONSTANT &&
+          (interpolation == cv::INTER_NEAREST || interpolation == cv::INTER_LINEAR || interpolation == cv::INTER_CUBIC)))
+        return false;
+
+    const char * const warp_op[2] = { "Affine", "Perspective" };
+    const char * const interpolationMap[3] = { "nearest", "linear", "cubic" };
+    ocl::ProgramSource program = ocl::imgproc::warp_transform_oclsrc;
+    String kernelName = format("warp%s_%s_8u", warp_op[op_type], interpolationMap[interpolation]);
+
+    bool is32f = (interpolation == INTER_CUBIC || interpolation == INTER_LINEAR) && op_type == OCL_OP_AFFINE;
+    int wdepth = interpolation == INTER_NEAREST ? depth : std::max(is32f ? CV_32F : CV_32S, depth);
+    int sctype = CV_MAKETYPE(wdepth, cn);
+
+    ocl::Kernel k;
+    String opts = format("-D ST=%s", ocl::typeToStr(sctype));
+
+    k.create(kernelName.c_str(), program, opts);
+    if (k.empty())
+        return false;
+
+    float borderBuf[] = { 0, 0, 0, 0 };
+    scalarToRawData(borderValue, borderBuf, sctype);
+
+    UMat src = _src.getUMat(), M0;
+    _dst.create( dsize.area() == 0 ? src.size() : dsize, src.type() );
+    UMat dst = _dst.getUMat();
+
+    float M[9];
+    int matRows = (op_type == OCL_OP_AFFINE ? 2 : 3);
+    Mat matM(matRows, 3, CV_32F, M), M1 = _M0.getMat();
+    CV_Assert( (M1.type() == CV_32F || M1.type() == CV_64F) && M1.rows == matRows && M1.cols == 3 );
+    M1.convertTo(matM, matM.type());
+
+    if( !(flags & WARP_INVERSE_MAP) )
+    {
+        if (op_type == OCL_OP_PERSPECTIVE)
+            invert(matM, matM);
+        else
+        {
+            float D = M[0]*M[4] - M[1]*M[3];
+            D = D != 0 ? 1.f/D : 0;
+            float A11 = M[4]*D, A22=M[0]*D;
+            M[0] = A11; M[1] *= -D;
+            M[3] *= -D; M[4] = A22;
+            float b1 = -M[0]*M[2] - M[1]*M[5];
+            float b2 = -M[3]*M[2] - M[4]*M[5];
+            M[2] = b1; M[5] = b2;
+        }
+    }
+    matM.convertTo(M0, CV_32F);
+
+    k.args(ocl::KernelArg::ReadOnly(src), ocl::KernelArg::WriteOnly(dst), ocl::KernelArg::PtrReadOnly(M0),
+           ocl::KernelArg(ocl::KernelArg::CONSTANT, 0, 0, 0, borderBuf, CV_ELEM_SIZE(sctype)));
+
+    size_t globalThreads[2];
+    globalThreads[0] = (size_t)(dst.cols / 4);
+    globalThreads[1] = (size_t)dst.rows;
+
+    return k.run(2, globalThreads, NULL, false);
+}
 
 static bool ocl_warpTransform(InputArray _src, OutputArray _dst, InputArray _M0,
                               Size dsize, int flags, int borderType, const Scalar& borderValue,
@@ -5741,7 +5902,7 @@ static bool ocl_warpTransform(InputArray _src, OutputArray _dst, InputArray _M0,
     matM.convertTo(M0, doubleSupport ? CV_64F : CV_32F);
 
     k.args(ocl::KernelArg::ReadOnly(src), ocl::KernelArg::WriteOnly(dst), ocl::KernelArg::PtrReadOnly(M0),
-           ocl::KernelArg(0, 0, 0, 0, borderBuf, CV_ELEM_SIZE(sctype)));
+           ocl::KernelArg(ocl::KernelArg::CONSTANT, 0, 0, 0, borderBuf, CV_ELEM_SIZE(sctype)));
 
     size_t globalThreads[2] = { (size_t)dst.cols, ((size_t)dst.rows + rowsPerWI - 1) / rowsPerWI };
     return k.run(2, globalThreads, NULL, false);
@@ -5789,6 +5950,11 @@ void cv::warpAffine( InputArray _src, OutputArray _dst,
                      int flags, int borderType, const Scalar& borderValue )
 {
     CV_INSTRUMENT_REGION()
+
+    CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat() &&
+               _src.cols() <= SHRT_MAX && _src.rows() <= SHRT_MAX,
+               ocl_warpTransform_cols4(_src, _dst, _M0, dsize, flags, borderType,
+                                       borderValue, OCL_OP_AFFINE))
 
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
                ocl_warpTransform(_src, _dst, _M0, dsize, flags, borderType,
@@ -6252,8 +6418,6 @@ public:
 
     virtual void operator() (const Range& range) const
     {
-        CV_INSTRUMENT_REGION_IPP()
-
         IppiSize srcsize = {src.cols, src.rows};
         IppiRect srcroi = {0, 0, src.cols, src.rows};
         IppiRect dstroi = {0, range.start, dst.cols, range.end - range.start};
@@ -6317,6 +6481,11 @@ void cv::warpPerspective( InputArray _src, OutputArray _dst, InputArray _M0,
     CV_INSTRUMENT_REGION()
 
     CV_Assert( _src.total() > 0 );
+
+    CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat() &&
+               _src.cols() <= SHRT_MAX && _src.rows() <= SHRT_MAX,
+               ocl_warpTransform_cols4(_src, _dst, _M0, dsize, flags, borderType, borderValue,
+                                       OCL_OP_PERSPECTIVE))
 
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
                ocl_warpTransform(_src, _dst, _M0, dsize, flags, borderType, borderValue,
