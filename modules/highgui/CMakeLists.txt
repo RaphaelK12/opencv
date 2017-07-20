@@ -1,4 +1,4 @@
-set(the_description "High-level GUI and Media I/O")
+set(the_description "High-level GUI")
 ocv_add_module(highgui opencv_imgproc opencv_imgcodecs OPTIONAL opencv_videoio WRAP python)
 
 # ----------------------------------------------------------------------------
@@ -22,6 +22,7 @@ set(highgui_hdrs
 
 set(highgui_srcs
     ${CMAKE_CURRENT_LIST_DIR}/src/window.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/roiSelector.cpp
     )
 
 file(GLOB highgui_ext_hdrs
