@@ -514,7 +514,7 @@ static void parallel_for_impl(const cv::Range& range, const cv::ParallelLoopBody
 
         #pragma omp parallel for schedule(dynamic) num_threads(numThreads > 0 ? numThreads : numThreadsMax)
         for (int i = stripeRange.start; i < stripeRange.end; ++i)
-            pbody(Range(i, i + 1));
+            pbody(i);
 
 #elif defined HAVE_GCD
 
