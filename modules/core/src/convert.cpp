@@ -770,10 +770,10 @@ struct Cvt_SIMD<double, int>
             int cWidth = v_float64x2::nlanes;
             for (; x <= width - cWidth * 2; x += cWidth * 2)
             {
-                v_float32x4 v_src0 = v_cvt_f32(v_load(src + x));
-                v_float32x4 v_src1 = v_cvt_f32(v_load(src + x + cWidth));
+                v_int32x4 v_src0 = v_round(v_load(src + x));
+                v_int32x4 v_src1 = v_round(v_load(src + x + cWidth));
 
-                v_store(dst + x, v_round(v_combine_low(v_src0, v_src1)));
+                v_store(dst + x, v_combine_low(v_src0, v_src1));
             }
         }
         return x;
@@ -1398,7 +1398,7 @@ cvtScaleHalf_<short, float>( const short* src, size_t sstep, float* dst, size_t 
 
 #define DEF_CVT_SCALE_FP16_FUNC(suffix, stype, dtype) \
 static void cvtScaleHalf##suffix( const stype* src, size_t sstep, \
-dtype* dst, size_t dstep, Size size) \
+dtype* dst, size_t dstep, Size size, void*) \
 { \
     cvtScaleHalf_<stype,dtype>(src, sstep, dst, dstep, size); \
 }

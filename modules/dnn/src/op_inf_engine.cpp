@@ -9,6 +9,11 @@
 #include "op_inf_engine.hpp"
 #include <opencv2/dnn/shape_utils.hpp>
 
+#ifdef HAVE_INF_ENGINE
+#include <ie_extension.h>
+#include <ie_plugin_dispatcher.hpp>
+#endif  // HAVE_INF_ENGINE
+
 namespace cv { namespace dnn {
 
 #ifdef HAVE_INF_ENGINE
@@ -102,6 +107,18 @@ void InfEngineBackendWrapper::setHostDirty()
 
 }
 
+InfEngineBackendNet::InfEngineBackendNet()
+{
+}
+
+InfEngineBackendNet::InfEngineBackendNet(InferenceEngine::CNNNetwork& net)
+{
+    inputs = net.getInputsInfo();
+    outputs = net.getOutputsInfo();
+    layers.resize(net.layerCount());  // A hack to execute InfEngineBackendNet::layerCount correctly.
+    initPlugin(net);
+}
+
 void InfEngineBackendNet::Release() noexcept
 {
     layers.clear();
@@ -116,6 +133,10 @@ InferenceEngine::Precision InfEngineBackendNet::getPrecision() noexcept
 
 // Assume that outputs of network is unconnected blobs.
 void InfEngineBackendNet::getOutputsInfo(InferenceEngine::OutputsDataMap &outputs_) noexcept
+{
+    outputs_ = outputs;
+}
+void InfEngineBackendNet::getOutputsInfo(InferenceEngine::OutputsDataMap &outputs_) const noexcept
 {
     outputs_ = outputs;
 }
@@ -213,56 +234,61 @@ size_t InfEngineBackendNet::getBatchSize() const noexcept
     return 0;
 }
 
-void InfEngineBackendNet::initEngine()
+void InfEngineBackendNet::init()
 {
-    CV_Assert(!isInitialized(), !layers.empty());
-
-    // Collect all external input blobs.
-    std::map<std::string, InferenceEngine::DataPtr> internalOutputs;
-    for (const auto& l : layers)
+    if (inputs.empty())
     {
-        for (const InferenceEngine::DataWeakPtr& ptr : l->insData)
+        // Collect all external input blobs.
+        inputs.clear();
+        std::map<std::string, InferenceEngine::DataPtr> internalOutputs;
+        for (const auto& l : layers)
         {
-            InferenceEngine::DataPtr inp(ptr);
-            if (internalOutputs.find(inp->name) == internalOutputs.end())
+            for (const InferenceEngine::DataWeakPtr& ptr : l->insData)
             {
-                InferenceEngine::InputInfo::Ptr inpInfo(new InferenceEngine::InputInfo());
-                inpInfo->setInputData(inp);
-                if (inputs.find(inp->name) == inputs.end())
-                    inputs[inp->name] = inpInfo;
+                InferenceEngine::DataPtr inp(ptr);
+                if (internalOutputs.find(inp->name) == internalOutputs.end())
+                {
+                    InferenceEngine::InputInfo::Ptr inpInfo(new InferenceEngine::InputInfo());
+                    inpInfo->setInputData(inp);
+                    if (inputs.find(inp->name) == inputs.end())
+                        inputs[inp->name] = inpInfo;
+                }
+            }
+            for (const InferenceEngine::DataPtr& out : l->outData)
+            {
+                // TODO: Replace to uniquness assertion.
+                if (internalOutputs.find(out->name) == internalOutputs.end())
+                    internalOutputs[out->name] = out;
             }
         }
-        for (const InferenceEngine::DataPtr& out : l->outData)
-        {
-            // TODO: Replace to uniquness assertion.
-            if (internalOutputs.find(out->name) == internalOutputs.end())
-                internalOutputs[out->name] = out;
-        }
+        CV_Assert(!inputs.empty());
     }
-    CV_Assert(!inputs.empty());
 
-    // Add all unconnected blobs to output blobs.
-    InferenceEngine::OutputsDataMap unconnectedOuts;
-    for (const auto& l : layers)
+    if (outputs.empty())
     {
-        // Add all outputs.
-        for (const InferenceEngine::DataPtr& out : l->outData)
+        // Add all unconnected blobs to output blobs.
+        InferenceEngine::OutputsDataMap unconnectedOuts;
+        for (const auto& l : layers)
         {
-            // TODO: Replace to uniquness assertion.
-            if (unconnectedOuts.find(out->name) == unconnectedOuts.end())
-                unconnectedOuts[out->name] = out;
+            // Add all outputs.
+            for (const InferenceEngine::DataPtr& out : l->outData)
+            {
+                // TODO: Replace to uniquness assertion.
+                if (unconnectedOuts.find(out->name) == unconnectedOuts.end())
+                    unconnectedOuts[out->name] = out;
+            }
+            // Remove internally connected outputs.
+            for (const InferenceEngine::DataWeakPtr& inp : l->insData)
+            {
+                unconnectedOuts.erase(InferenceEngine::DataPtr(inp)->name);
+            }
         }
-        // Remove internally connected outputs.
-        for (const InferenceEngine::DataWeakPtr& inp : l->insData)
-        {
-            unconnectedOuts.erase(InferenceEngine::DataPtr(inp)->name);
-        }
-    }
-    CV_Assert(!unconnectedOuts.empty());
+        CV_Assert(!unconnectedOuts.empty());
 
-    for (auto it = unconnectedOuts.begin(); it != unconnectedOuts.end(); ++it)
-    {
-        outputs[it->first] = it->second;
+        for (auto it = unconnectedOuts.begin(); it != unconnectedOuts.end(); ++it)
+        {
+            outputs[it->first] = it->second;
+        }
     }
 
     // Set up input blobs.
@@ -281,20 +307,40 @@ void InfEngineBackendNet::initEngine()
         outBlobs[it.first] = allBlobs[it.first];
     }
 
-#ifdef _WIN32
-    engine = InferenceEngine::InferenceEnginePluginPtr("MKLDNNPlugin.dll");
-#else
-    engine = InferenceEngine::InferenceEnginePluginPtr("libMKLDNNPlugin.so");
-#endif  // _WIN32
+    if (!isInitialized())
+        initPlugin(*this);
+}
+
+void InfEngineBackendNet::initPlugin(InferenceEngine::ICNNNetwork& net)
+{
+    CV_Assert(!isInitialized());
+
+    InferenceEngine::StatusCode status;
     InferenceEngine::ResponseDesc resp;
-    InferenceEngine::StatusCode status = engine->LoadNetwork(*this, &resp);
+    const InferenceEngine::Version* v = InferenceEngine::GetInferenceEngineVersion();
+
+    plugin = InferenceEngine::PluginDispatcher({""}).getSuitablePlugin(InferenceEngine::TargetDevice::eCPU);
+    if (std::atoi(v->buildNumber) > 5855)
+    {
+#ifdef _WIN32
+        InferenceEngine::IExtensionPtr extension =
+            InferenceEngine::make_so_pointer<InferenceEngine::IExtension>("cpu_extension.dll");
+#else
+        InferenceEngine::IExtensionPtr extension =
+            InferenceEngine::make_so_pointer<InferenceEngine::IExtension>("libcpu_extension.so");
+#endif  // _WIN32
+        status = plugin->AddExtension(extension, &resp);
+        if (status != InferenceEngine::StatusCode::OK)
+            CV_Error(Error::StsAssert, resp.msg);
+    }
+    status = plugin->LoadNetwork(net, &resp);
     if (status != InferenceEngine::StatusCode::OK)
         CV_Error(Error::StsAssert, resp.msg);
 }
 
 bool InfEngineBackendNet::isInitialized()
 {
-    return (bool)engine;
+    return (bool)plugin;
 }
 
 void InfEngineBackendNet::addBlobs(const std::vector<Ptr<BackendWrapper> >& ptrs)
@@ -309,7 +355,7 @@ void InfEngineBackendNet::addBlobs(const std::vector<Ptr<BackendWrapper> >& ptrs
 void InfEngineBackendNet::forward()
 {
     InferenceEngine::ResponseDesc resp;
-    InferenceEngine::StatusCode status = engine->Infer(inpBlobs, outBlobs, &resp);
+    InferenceEngine::StatusCode status = plugin->Infer(inpBlobs, outBlobs, &resp);
     if (status != InferenceEngine::StatusCode::OK)
         CV_Error(Error::StsAssert, resp.msg);
 }
@@ -371,6 +417,41 @@ void fuseConvWeights(const std::shared_ptr<InferenceEngine::ConvolutionLayer>& c
     }
     else
         conv->_biases = wrapToInfEngineBlob(b);
+}
+
+InfEngineBackendLayer::InfEngineBackendLayer(const InferenceEngine::DataPtr& output_)
+{
+    output = output_;
+}
+
+bool InfEngineBackendLayer::getMemoryShapes(const std::vector<MatShape> &inputs,
+                                            const int requiredOutputs,
+                                            std::vector<MatShape> &outputs,
+                                            std::vector<MatShape> &internals) const
+{
+    std::vector<size_t> dims = output->dims;
+    std::vector<int> shape(dims.begin(), dims.end());
+    std::reverse(shape.begin(), shape.end());
+    outputs.assign(1, shape);
+    return false;
+}
+
+bool InfEngineBackendLayer::supportBackend(int backendId)
+{
+    return backendId == DNN_BACKEND_DEFAULT ||
+           backendId == DNN_BACKEND_INFERENCE_ENGINE && haveInfEngine();
+}
+
+void InfEngineBackendLayer::forward(std::vector<Mat*> &input, std::vector<Mat> &output,
+                                    std::vector<Mat> &internals)
+{
+    CV_Error(Error::StsError, "Choose Inference Engine as a preferable backend.");
+}
+
+void InfEngineBackendLayer::forward(InputArrayOfArrays inputs, OutputArrayOfArrays outputs,
+                                    OutputArrayOfArrays internals)
+{
+    CV_Error(Error::StsInternal, "Choose Inference Engine as a preferable backend.");
 }
 
 #endif  // HAVE_INF_ENGINE
